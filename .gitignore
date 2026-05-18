@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# Generated calibration outputs
+calibration_output*/
+
+# Temporary report extraction artifacts
+report_media/
+extracted_report_text.txt
