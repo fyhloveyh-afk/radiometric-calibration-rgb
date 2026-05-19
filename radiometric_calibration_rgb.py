@@ -35,6 +35,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import images_to_blackbody_measurements as image_measurements
+
 
 CHANNELS = ("r", "g", "b")
 RESPONSE_COLUMNS = {"r": "red", "g": "green", "b": "blue"}
@@ -481,6 +483,96 @@ def write_blackbody_template(path: Path) -> None:
     template.to_csv(path, index=False, encoding="utf-8-sig")
 
 
+def add_image_folder_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--image-dir", type=Path, help="folder containing blackbody light raw images")
+    parser.add_argument("--dark-dir", type=Path, help="optional folder containing dark raw images")
+    parser.add_argument("--roi", type=image_measurements.parse_roi, help="ROI as x,y,width,height")
+    parser.add_argument("--raw-width", type=int, help="raw image width in pixels")
+    parser.add_argument("--raw-height", type=int, help="raw image height in pixels")
+    parser.add_argument("--raw-dtype", default="uint16", help="raw sample dtype, for example uint8 or uint16")
+    parser.add_argument("--raw-channels", type=int, default=3, help="number of packed channels per pixel")
+    parser.add_argument(
+        "--raw-channel-order",
+        type=image_measurements.parse_channel_order,
+        default=image_measurements.parse_channel_order("rgb"),
+        help="raw channel order, rgb or bgr",
+    )
+    parser.add_argument("--raw-byte-order", choices=["native", "little", "big"], default="native")
+    parser.add_argument("--raw-ext", default=".raw", help="raw file extension, default .raw")
+    parser.add_argument("--emissivity", type=float, default=1.0, help="blackbody emissivity for image-folder mode")
+    parser.add_argument("--dark-r", type=float, help="constant dark R value")
+    parser.add_argument("--dark-g", type=float, help="constant dark G value")
+    parser.add_argument("--dark-b", type=float, help="constant dark B value")
+    parser.add_argument("--use-zero-dark", action="store_true", help="use zero dark values in image-folder mode")
+    parser.add_argument(
+        "--write-generated-measurements",
+        type=Path,
+        help="optional path to save the measurement CSV generated from --image-dir",
+    )
+
+
+def validate_image_folder_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.image_dir is None:
+        return
+
+    if args.measurements is not None:
+        parser.error("choose either --measurements or --image-dir, not both")
+    if args.roi is None:
+        parser.error("--roi is required when using --image-dir")
+    if args.raw_width is None or args.raw_height is None:
+        parser.error("--raw-width and --raw-height are required when using --image-dir")
+    if args.raw_width <= 0 or args.raw_height <= 0 or args.raw_channels < 3:
+        parser.error("--raw-width/--raw-height must be positive and --raw-channels must be at least 3")
+
+    constant_dark_values = [args.dark_r, args.dark_g, args.dark_b]
+    has_partial_constant_dark = any(v is not None for v in constant_dark_values) and not all(
+        v is not None for v in constant_dark_values
+    )
+    if has_partial_constant_dark:
+        parser.error("--dark-r, --dark-g, and --dark-b must be provided together")
+
+    dark_source_count = int(args.dark_dir is not None) + int(all(v is not None for v in constant_dark_values)) + int(
+        args.use_zero_dark
+    )
+    if dark_source_count == 0:
+        parser.error("provide --dark-dir, constant --dark-r/--dark-g/--dark-b, or --use-zero-dark with --image-dir")
+    if dark_source_count > 1:
+        parser.error("choose only one dark source: --dark-dir, constant dark values, or --use-zero-dark")
+
+
+def image_folder_args_for_converter(args: argparse.Namespace) -> argparse.Namespace:
+    return argparse.Namespace(
+        image_dir=args.image_dir,
+        roi=args.roi,
+        width=args.raw_width,
+        height=args.raw_height,
+        dtype=args.raw_dtype,
+        channels=args.raw_channels,
+        channel_order=args.raw_channel_order,
+        byte_order=args.raw_byte_order,
+        raw_ext=args.raw_ext,
+        emissivity=args.emissivity,
+        dark_dir=args.dark_dir,
+        dark_r=args.dark_r,
+        dark_g=args.dark_g,
+        dark_b=args.dark_b,
+        use_zero_dark=args.use_zero_dark,
+    )
+
+
+def load_measurements(args: argparse.Namespace) -> tuple[pd.DataFrame, Path]:
+    if args.image_dir is None:
+        return pd.read_csv(args.measurements), args.measurements
+
+    rows = image_measurements.build_rows_from_image_folder(image_folder_args_for_converter(args))
+    measurements = pd.DataFrame(rows)
+    measurement_path = args.write_generated_measurements or (args.output_dir / "generated_blackbody_measurements.csv")
+    measurement_path.parent.mkdir(parents=True, exist_ok=True)
+    measurements.to_csv(measurement_path, index=False, encoding="utf-8-sig")
+    print(f"Wrote generated measurements: {measurement_path}")
+    return measurements, measurement_path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RGB camera radiometric calibration")
     parser.add_argument("--measurements", type=Path, help="measurement CSV")
@@ -493,7 +585,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("calibration_output"))
     parser.add_argument("--write-template", type=Path, help="write a measurement CSV template and exit")
     parser.add_argument("--write-blackbody-template", type=Path, help="write a blackbody measurement CSV template and exit")
-    return parser.parse_args()
+    add_image_folder_args(parser)
+    args = parser.parse_args()
+    validate_image_folder_args(parser, args)
+    return args
 
 
 def main() -> None:
@@ -509,8 +604,10 @@ def main() -> None:
         print(f"Wrote blackbody template: {args.write_blackbody_template}")
         return
 
-    if args.measurements is None or args.spectral_response is None:
-        raise SystemExit("--measurements and --spectral-response are required unless --write-template is used")
+    if args.spectral_response is None or (args.measurements is None and args.image_dir is None):
+        raise SystemExit(
+            "--spectral-response and either --measurements or --image-dir are required unless --write-template is used"
+        )
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -520,8 +617,8 @@ def main() -> None:
     eff.to_csv(output_dir / "effective_response.csv", index=False, encoding="utf-8-sig")
     plot_effective_response(eff, output_dir)
 
-    measurements = pd.read_csv(args.measurements)
-    fit_table = prepare_fit_table(measurements, args.measurements, eff, args.reference_kind)
+    measurements, measurement_path = load_measurements(args)
+    fit_table = prepare_fit_table(measurements, measurement_path, eff, args.reference_kind)
     fit_table.to_csv(output_dir / "calibration_fit_table.csv", index=False, encoding="utf-8-sig")
 
     results: Dict[str, Dict[str, object]] = {}

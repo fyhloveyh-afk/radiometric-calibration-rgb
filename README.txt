@@ -200,6 +200,83 @@ radiometric_calibration_rgb.py
 也就是说，黑体温度会先被转换成随波长变化的黑体光谱辐亮度，再经过 R/G/B 通道光谱响应和 650 nm 滤光片加权。
 
 
+方式 C 辅助：从标定图片文件夹自动生成黑体测量 CSV
+------------------------------------------------
+
+如果每个相机的标定图片已经按文件夹整理，可以先用：
+
+    images_to_blackbody_measurements.py
+
+把 RAW 图片的 ROI 均值转换成黑体测量 CSV。
+
+亮场 RAW 文件命名规则：
+
+    黑体温度摄氏度_曝光时间ms_第几次.raw
+
+示例：
+
+    900_100_1.raw
+    900_100_2.raw
+    900_100_3.raw
+    1000_100_1.raw
+
+同名 BMP 文件可以放在同一目录中，用来人工判断 ROI；转换脚本默认只读取指定后缀的 RAW 文件，不读取 BMP。
+
+暗场建议单独放一个文件夹，并按相同曝光时间拍摄，命名规则：
+
+    dark_曝光时间ms_第几次.raw
+
+示例：
+
+    dark_100_1.raw
+    dark_100_2.raw
+    dark_100_3.raw
+
+运行示例：
+
+    python .\images_to_blackbody_measurements.py `
+      --image-dir .\camera01_blackbody_images `
+      --dark-dir .\camera01_dark_images `
+      --output-csv .\camera01_blackbody_measurements.csv `
+      --roi 420,310,120,120 `
+      --width 1920 `
+      --height 1080 `
+      --dtype uint16 `
+      --channels 3 `
+      --channel-order rgb `
+      --raw-ext .raw
+
+其中：
+
+    --roi x,y,width,height
+        ROI 坐标，按 BMP 图像中看到的像素坐标填写。
+
+    --width / --height
+        RAW 图像宽高。RAW 文件通常不自带尺寸信息，必须手动指定。
+
+    --dtype
+        RAW 单个通道的数据类型，常见为 uint8 或 uint16。
+
+    --channels
+        每个像素的通道数。如果 RAW 是打包 RGB，一般为 3。
+
+    --channel-order
+        RAW 通道顺序。常见为 rgb 或 bgr。
+
+输出 CSV 会包含：
+
+    level,blackbody_temp_c,emissivity,exposure_ms,dn_r,dn_g,dn_b,dark_r,dark_g,dark_b,repeat_count
+
+其中 dn_r/g/b 是同一温度、同一曝光时间下多次拍摄的 ROI 平均值再求平均。
+repeat_count 只是辅助检查列，主标定脚本会忽略它。
+
+如果暂时没有暗场文件，也可以临时使用：
+
+    --use-zero-dark
+
+但正式标定不建议这样做。更推荐每个曝光时间都拍对应暗场。
+
+
 三、650 nm 截止滤光片处理方式
 -----------------------------
 
@@ -271,6 +348,34 @@ radiometric_calibration_rgb.py
       --reference-kind normalized `
       --model linear `
       --output-dir .\calibration_output_blackbody
+
+
+3.1 从 RAW 图片文件夹直接生成测量表并完成黑体标定
+
+如果亮场 RAW 图片已经按“黑体温度_曝光时间_第几次”命名，可以不手动准备
+measurements CSV，直接运行：
+
+    python .\radiometric_calibration_rgb.py `
+      --image-dir .\camera01_blackbody_images `
+      --dark-dir .\camera01_dark_images `
+      --roi 420,310,120,120 `
+      --raw-width 1920 `
+      --raw-height 1080 `
+      --raw-dtype uint16 `
+      --raw-channels 3 `
+      --raw-channel-order rgb `
+      --raw-ext .raw `
+      --spectral-response "\\wsl.localhost\Ubuntu-22.04\home\yuhao\数据模拟\spectral_response_full.csv" `
+      --cutoff-nm 650 `
+      --reference-kind normalized `
+      --model linear `
+      --output-dir .\calibration_output_camera01
+
+脚本会在输出目录中同时保存：
+
+    generated_blackbody_measurements.csv
+
+这份 CSV 是从 RAW ROI 均值自动整理出来的中间测量表，方便复查。
 
 
 4. 使用真实滤光片透过率曲线
