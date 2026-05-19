@@ -68,6 +68,13 @@ def parse_channel_order(text: str) -> tuple[int, int, int]:
     return tuple(order.index(ch) for ch in "rgb")
 
 
+def parse_bayer_pattern(text: str) -> str:
+    pattern = text.strip().lower()
+    if pattern not in {"rggb", "bggr", "grbg", "gbrg"}:
+        raise argparse.ArgumentTypeError("Bayer pattern must be one of rggb, bggr, grbg, gbrg")
+    return pattern
+
+
 def float_key(value: float) -> str:
     return f"{value:g}"
 
@@ -123,7 +130,7 @@ def collect_dark_records(folder: Path, raw_ext: str) -> list[ImageRecord]:
     return records
 
 
-def read_raw_rgb(
+def read_raw_image(
     path: Path,
     width: int,
     height: int,
@@ -143,13 +150,16 @@ def read_raw_rgb(
             f"{path.name}: expected {expected} values for {width}x{height}x{channels}, got {data.size}"
         )
 
+    if channels == 1:
+        return data.reshape((height, width)).astype(np.float64, copy=False)
+
     image = data.reshape((height, width, channels))
     if channels < 3:
-        raise ValueError("this converter expects packed RGB/BGR-like raw data with at least 3 channels")
+        raise ValueError("packed color raw data must have at least 3 channels")
     return image[:, :, list(channel_order)].astype(np.float64, copy=False)
 
 
-def roi_mean_rgb(image: np.ndarray, roi: tuple[int, int, int, int], path: Path) -> tuple[float, float, float]:
+def roi_mean_packed_rgb(image: np.ndarray, roi: tuple[int, int, int, int], path: Path) -> tuple[float, float, float]:
     x, y, width, height = roi
     y2 = y + height
     x2 = x + width
@@ -160,13 +170,55 @@ def roi_mean_rgb(image: np.ndarray, roi: tuple[int, int, int, int], path: Path) 
     return float(mean[0]), float(mean[1]), float(mean[2])
 
 
+def roi_mean_bayer(image: np.ndarray, roi: tuple[int, int, int, int], pattern: str, path: Path) -> tuple[float, float, float]:
+    x, y, width, height = roi
+    y2 = y + height
+    x2 = x + width
+    if y2 > image.shape[0] or x2 > image.shape[1]:
+        raise ValueError(f"{path.name}: ROI {roi} exceeds image size {image.shape[1]}x{image.shape[0]}")
+
+    roi_image = image[y:y2, x:x2]
+    color_at = {
+        (0, 0): pattern[0],
+        (0, 1): pattern[1],
+        (1, 0): pattern[2],
+        (1, 1): pattern[3],
+    }
+    means: dict[str, list[float]] = {"r": [], "g": [], "b": []}
+    for row_parity in (0, 1):
+        for col_parity in (0, 1):
+            color = color_at[((y + row_parity) % 2, (x + col_parity) % 2)]
+            samples = roi_image[row_parity::2, col_parity::2]
+            if samples.size:
+                means[color].append(float(samples.mean()))
+
+    missing = [color for color, values in means.items() if not values]
+    if missing:
+        raise ValueError(f"{path.name}: ROI is too small to include Bayer colors: {missing}")
+    return (
+        float(np.mean(means["r"])),
+        float(np.mean(means["g"])),
+        float(np.mean(means["b"])),
+    )
+
+
+def roi_mean_rgb(image: np.ndarray, roi: tuple[int, int, int, int], args: argparse.Namespace, path: Path) -> tuple[float, float, float]:
+    if args.raw_format == "bayer":
+        if image.ndim != 2:
+            raise ValueError("--raw-format bayer expects --channels 1")
+        return roi_mean_bayer(image, roi, args.bayer_pattern, path)
+    if image.ndim != 3:
+        raise ValueError("--raw-format rgb expects packed RGB/BGR data")
+    return roi_mean_packed_rgb(image, roi, path)
+
+
 def average_records(
     records: Iterable[ImageRecord],
     args: argparse.Namespace,
 ) -> dict[tuple[float | None, float], tuple[float, float, float, int]]:
     grouped: dict[tuple[float | None, float], list[tuple[float, float, float]]] = defaultdict(list)
     for record in records:
-        image = read_raw_rgb(
+        image = read_raw_image(
             record.path,
             args.width,
             args.height,
@@ -175,7 +227,7 @@ def average_records(
             args.channel_order,
             args.byte_order,
         )
-        grouped[(record.temperature_c, record.exposure_ms)].append(roi_mean_rgb(image, args.roi, record.path))
+        grouped[(record.temperature_c, record.exposure_ms)].append(roi_mean_rgb(image, args.roi, args, record.path))
 
     averaged: dict[tuple[float | None, float], tuple[float, float, float, int]] = {}
     for key, values in grouped.items():
@@ -295,6 +347,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="uint16", help="raw sample dtype, for example uint8, uint16, >u2, <u2")
     parser.add_argument("--channels", type=int, default=3, help="number of packed channels per pixel")
     parser.add_argument("--channel-order", type=parse_channel_order, default=parse_channel_order("rgb"), help="raw channel order, rgb or bgr")
+    parser.add_argument("--raw-format", choices=["rgb", "bayer"], default="rgb", help="raw color format")
+    parser.add_argument("--bayer-pattern", type=parse_bayer_pattern, default="gbrg", help="Bayer pattern for --raw-format bayer")
     parser.add_argument("--byte-order", choices=["native", "little", "big"], default="native")
     parser.add_argument("--raw-ext", default=".raw", help="raw file extension, default .raw")
     parser.add_argument("--emissivity", type=float, default=1.0, help="blackbody emissivity")
@@ -305,8 +359,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-zero-dark", action="store_true", help="write dark values as 0 when no dark frames are available")
     args = parser.parse_args()
 
-    if args.width <= 0 or args.height <= 0 or args.channels < 3:
-        parser.error("--width/--height must be positive and --channels must be at least 3")
+    if args.width <= 0 or args.height <= 0:
+        parser.error("--width/--height must be positive")
+    if args.raw_format == "rgb" and args.channels < 3:
+        parser.error("--channels must be at least 3 for RGB mode")
+    if args.raw_format == "bayer" and args.channels != 1:
+        parser.error("--raw-format bayer requires --channels 1")
 
     constant_dark_values = [args.dark_r, args.dark_g, args.dark_b]
     has_partial_constant_dark = any(v is not None for v in constant_dark_values) and not all(

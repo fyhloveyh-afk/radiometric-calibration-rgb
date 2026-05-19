@@ -490,12 +490,19 @@ def add_image_folder_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--raw-width", type=int, help="raw image width in pixels")
     parser.add_argument("--raw-height", type=int, help="raw image height in pixels")
     parser.add_argument("--raw-dtype", default="uint16", help="raw sample dtype, for example uint8 or uint16")
-    parser.add_argument("--raw-channels", type=int, default=3, help="number of packed channels per pixel")
+    parser.add_argument("--raw-channels", type=int, default=3, help="number of channels per pixel; use 1 for Bayer raw")
     parser.add_argument(
         "--raw-channel-order",
         type=image_measurements.parse_channel_order,
         default=image_measurements.parse_channel_order("rgb"),
         help="raw channel order, rgb or bgr",
+    )
+    parser.add_argument("--raw-format", choices=["rgb", "bayer"], default="rgb", help="raw color format")
+    parser.add_argument(
+        "--bayer-pattern",
+        type=image_measurements.parse_bayer_pattern,
+        default=image_measurements.parse_bayer_pattern("gbrg"),
+        help="Bayer pattern for --raw-format bayer",
     )
     parser.add_argument("--raw-byte-order", choices=["native", "little", "big"], default="native")
     parser.add_argument("--raw-ext", default=".raw", help="raw file extension, default .raw")
@@ -521,8 +528,12 @@ def validate_image_folder_args(parser: argparse.ArgumentParser, args: argparse.N
         parser.error("--roi is required when using --image-dir")
     if args.raw_width is None or args.raw_height is None:
         parser.error("--raw-width and --raw-height are required when using --image-dir")
-    if args.raw_width <= 0 or args.raw_height <= 0 or args.raw_channels < 3:
-        parser.error("--raw-width/--raw-height must be positive and --raw-channels must be at least 3")
+    if args.raw_width <= 0 or args.raw_height <= 0:
+        parser.error("--raw-width/--raw-height must be positive")
+    if args.raw_format == "rgb" and args.raw_channels < 3:
+        parser.error("--raw-channels must be at least 3 for RGB mode")
+    if args.raw_format == "bayer" and args.raw_channels != 1:
+        parser.error("--raw-format bayer requires --raw-channels 1")
 
     constant_dark_values = [args.dark_r, args.dark_g, args.dark_b]
     has_partial_constant_dark = any(v is not None for v in constant_dark_values) and not all(
@@ -549,6 +560,8 @@ def image_folder_args_for_converter(args: argparse.Namespace) -> argparse.Namesp
         dtype=args.raw_dtype,
         channels=args.raw_channels,
         channel_order=args.raw_channel_order,
+        raw_format=args.raw_format,
+        bayer_pattern=args.bayer_pattern,
         byte_order=args.raw_byte_order,
         raw_ext=args.raw_ext,
         emissivity=args.emissivity,
