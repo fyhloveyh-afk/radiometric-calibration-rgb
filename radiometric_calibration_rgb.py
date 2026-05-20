@@ -393,6 +393,7 @@ def exposure_stability_diagnostics(
             x_standard = sub[f"x_{ch}"].to_numpy(float)
             x_corrected = sub[f"x_intercept_{ch}"].to_numpy(float)
             exposures = sub["exposure_s_used"].to_numpy(float)
+            q = float(corrections[ch]["q_intercept"])
             rows.append(
                 {
                     "channel": ch,
@@ -400,7 +401,7 @@ def exposure_stability_diagnostics(
                     "n": len(sub),
                     "exposure_min_s": float(np.min(exposures)),
                     "exposure_max_s": float(np.max(exposures)),
-                    "q_intercept": float(corrections[ch]["q_intercept"]),
+                    "q_intercept": q,
                     "intercept_model_r2": float(corrections[ch]["r2"]),
                     "standard_x_mean": float(np.mean(x_standard)),
                     "standard_x_rel_span_percent": safe_rel_span_percent(x_standard),
@@ -410,6 +411,50 @@ def exposure_stability_diagnostics(
                     "intercept_x_cv_percent": safe_cv_percent(x_corrected),
                 }
             )
+    return pd.DataFrame(rows)
+
+
+def exposure_window_diagnostics(
+    fit_table: pd.DataFrame,
+    min_points: int = 2,
+) -> pd.DataFrame:
+    groups = exposure_group_keys(fit_table)
+    rows = []
+    for group in sorted(groups.unique()):
+        sub_group = fit_table[groups == group].copy()
+        if sub_group.empty:
+            continue
+        exposure_values = sorted(float(v) for v in sub_group["exposure_s_used"].dropna().unique())
+        max_exposure = max(exposure_values) if exposure_values else float("nan")
+        for min_exposure in exposure_values:
+            window = sub_group[sub_group["exposure_s_used"] >= min_exposure]
+            exposure_level_count = int(window["exposure_s_used"].nunique())
+            if exposure_level_count < min_points:
+                continue
+            for ch in CHANNELS:
+                standard_x = window[f"x_{ch}"].to_numpy(float)
+                corrected_x = window[f"x_intercept_{ch}"].to_numpy(float)
+                standard_span = safe_rel_span_percent(standard_x)
+                corrected_span = safe_rel_span_percent(corrected_x)
+                rows.append(
+                    {
+                        "group": group,
+                        "channel": ch,
+                        "min_exposure_s": float(min_exposure),
+                        "max_exposure_s": float(max_exposure),
+                        "min_exposure_ms": float(min_exposure * 1000.0),
+                        "max_exposure_ms": float(max_exposure * 1000.0),
+                        "n": len(window),
+                        "exposure_level_count": exposure_level_count,
+                        "standard_x_rel_span_percent": standard_span,
+                        "intercept_x_rel_span_percent": corrected_span,
+                        "span_improvement_percent": float(standard_span - corrected_span)
+                        if np.isfinite(standard_span) and np.isfinite(corrected_span)
+                        else float("nan"),
+                        "standard_x_cv_percent": safe_cv_percent(standard_x),
+                        "intercept_x_cv_percent": safe_cv_percent(corrected_x),
+                    }
+                )
     return pd.DataFrame(rows)
 
 
@@ -639,6 +684,8 @@ def write_comparison_report(
     output_dir: Path,
     comparison: pd.DataFrame,
     corrections: Dict[str, Dict[str, object]],
+    diagnostics: pd.DataFrame,
+    window_diagnostics: pd.DataFrame,
 ) -> None:
     lines = ["# Calibration Form Comparison", ""]
     lines.append("This run outputs both the standard exposure normalization and the residual-intercept corrected form.")
@@ -673,7 +720,119 @@ def write_comparison_report(
         )
     lines.append("")
     lines.append("Use the corrected form only when exposure-linearity diagnostics show that a residual intercept improves cross-exposure stability.")
+    lines.append("")
+    lines.append("Exposure linearity and X stability by group:")
+    lines.append("")
+    lines.append("The exposure-linearity R2 is computed from the direct model:")
+    lines.append("")
+    lines.append("    DN_corr_c(level, t) = S_c(level) * t + q_c")
+    lines.append("")
+    lines.append("A high R2 means DN_c - Dark_c is close to linear with exposure time. The X span columns show whether direct exposure division or residual-intercept correction is more stable across exposure times.")
+    lines.append("")
+    lines.append("| Channel | Group | linear R2 | q | standard X span % | corrected X span % |")
+    lines.append("| --- | --- | ---: | ---: | ---: | ---: |")
+    for _, row in diagnostics.iterrows():
+        lines.append(
+            f"| {str(row['channel']).upper()} | {row['group']} | "
+            f"{float(row['intercept_model_r2']):.8f} | "
+            f"{float(row['q_intercept']):.6g} | "
+            f"{float(row['standard_x_rel_span_percent']):.4f} | "
+            f"{float(row['intercept_x_rel_span_percent']):.4f} |"
+        )
+    if not window_diagnostics.empty:
+        lines.append("")
+        lines.append("Exposure-window X stability:")
+        lines.append("")
+        lines.append("Each row uses data from min exposure through the maximum exposure in that group.")
+        lines.append("")
+        lines.append("| Channel | Group | Window ms | standard X span % | corrected X span % | improvement % |")
+        lines.append("| --- | --- | --- | ---: | ---: | ---: |")
+        for _, row in window_diagnostics.iterrows():
+            lines.append(
+                f"| {str(row['channel']).upper()} | {row['group']} | "
+                f"{float(row['min_exposure_ms']):.6g}-{float(row['max_exposure_ms']):.6g} | "
+                f"{float(row['standard_x_rel_span_percent']):.4f} | "
+                f"{float(row['intercept_x_rel_span_percent']):.4f} | "
+                f"{float(row['span_improvement_percent']):.4f} |"
+            )
     (output_dir / "calibration_comparison.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def plot_exposure_window_diagnostics(window_diagnostics: pd.DataFrame, output_dir: Path) -> None:
+    if window_diagnostics.empty:
+        return
+    for group in sorted(window_diagnostics["group"].unique()):
+        group_df = window_diagnostics[window_diagnostics["group"] == group]
+        plt.figure(figsize=(8.4, 5.0))
+        for ch, color in [("r", "red"), ("g", "green"), ("b", "blue")]:
+            ch_df = group_df[group_df["channel"] == ch].sort_values("min_exposure_ms")
+            if ch_df.empty:
+                continue
+            plt.plot(
+                ch_df["min_exposure_ms"],
+                ch_df["standard_x_rel_span_percent"],
+                marker="o",
+                linestyle="--",
+                color=color,
+                alpha=0.55,
+                label=f"{ch.upper()} standard",
+            )
+            plt.plot(
+                ch_df["min_exposure_ms"],
+                ch_df["intercept_x_rel_span_percent"],
+                marker="o",
+                linestyle="-",
+                color=color,
+                label=f"{ch.upper()} corrected",
+            )
+        max_exposure = float(group_df["max_exposure_ms"].max())
+        plt.xlabel(f"Minimum exposure included (ms), window ends at {max_exposure:.6g} ms")
+        plt.ylabel("X relative span (%)")
+        plt.title(f"Exposure-window X stability: {group}")
+        plt.grid(True, alpha=0.25)
+        plt.legend(ncol=2, fontsize=9)
+        plt.tight_layout()
+        safe_group = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(group))
+        plt.savefig(output_dir / f"exposure_window_stability_{safe_group}.png", dpi=180)
+        plt.close()
+
+    summary = (
+        window_diagnostics.groupby(["channel", "min_exposure_ms"], as_index=False)[
+            ["standard_x_rel_span_percent", "intercept_x_rel_span_percent"]
+        ]
+        .mean()
+        .sort_values(["channel", "min_exposure_ms"])
+    )
+    plt.figure(figsize=(8.4, 5.0))
+    for ch, color in [("r", "red"), ("g", "green"), ("b", "blue")]:
+        ch_df = summary[summary["channel"] == ch]
+        if ch_df.empty:
+            continue
+        plt.plot(
+            ch_df["min_exposure_ms"],
+            ch_df["standard_x_rel_span_percent"],
+            marker="o",
+            linestyle="--",
+            color=color,
+            alpha=0.55,
+            label=f"{ch.upper()} standard",
+        )
+        plt.plot(
+            ch_df["min_exposure_ms"],
+            ch_df["intercept_x_rel_span_percent"],
+            marker="o",
+            linestyle="-",
+            color=color,
+            label=f"{ch.upper()} corrected",
+        )
+    plt.xlabel("Minimum exposure included (ms)")
+    plt.ylabel("Mean X relative span across groups (%)")
+    plt.title("Exposure-window X stability summary")
+    plt.grid(True, alpha=0.25)
+    plt.legend(ncol=2, fontsize=9)
+    plt.tight_layout()
+    plt.savefig(output_dir / "exposure_window_stability_summary.png", dpi=180)
+    plt.close()
 
 
 def write_template(path: Path) -> None:
@@ -896,6 +1055,9 @@ def main() -> None:
 
     diagnostics = exposure_stability_diagnostics(fit_table, exposure_corrections)
     diagnostics.to_csv(output_dir / "exposure_linearity_diagnostics.csv", index=False, encoding="utf-8-sig")
+    window_diagnostics = exposure_window_diagnostics(fit_table)
+    window_diagnostics.to_csv(output_dir / "exposure_window_diagnostics.csv", index=False, encoding="utf-8-sig")
+    plot_exposure_window_diagnostics(window_diagnostics, output_dir)
     (output_dir / "exposure_intercept_correction.json").write_text(
         json.dumps(exposure_corrections, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -959,7 +1121,7 @@ def main() -> None:
             "    X_c = (DN_c - Dark_c - q_c) / exposure_s",
         ],
     )
-    write_comparison_report(output_dir, comparison, exposure_corrections)
+    write_comparison_report(output_dir, comparison, exposure_corrections, diagnostics, window_diagnostics)
     write_report(
         standard_results,
         output_dir,

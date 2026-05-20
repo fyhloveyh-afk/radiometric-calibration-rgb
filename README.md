@@ -547,12 +547,13 @@ measurements CSV，直接运行：
     5. ROI 不够均匀，或者 ROI 中存在边缘、反光、阴影和空间纹理。
     6. 曝光时间记录和真实积分时间存在小偏差。
 
-如果 DN_c - Dark_c 对 exposure_s 本身就明显弯曲，而不是接近一条带截距的直线，才建议考虑更复杂的曝光响应函数，例如：
+如果 DN_c - Dark_c 对 exposure_s 本身就明显弯曲，而不是接近一条带截距的直线，说明当前的标准模型和残余截距校正模型都可能不足。这种情况下应先检查相机设置、光源稳定性、饱和情况和暗场匹配情况；确认这些都没有问题后，再考虑更复杂的曝光响应函数。
 
-    g_c(t) = t_ref * (t / t_ref)^p_c
-    X_c = (DN_c - Dark_c) / g_c(t)
+因此脚本优先输出的是直接线性判定：
 
-其中 p_c 是通道 c 的经验曝光非线性指数。若 p_c 接近 1，说明曝光接近线性。该模型应作为经验校正使用，并用独立数据验证校正后的 X 是否更一致。
+    DN_corr_c(level, t) = S_c(level) * t + q_c
+
+其中的 exposure-linearity R2 用来判断 DN_c - Dark_c 是否确实随曝光时间接近线性。如果 R2 很高，且截距校正后的 X 跨曝光更稳定，说明残余截距校正是合理的。如果 R2 不高，则不应只依赖 q_c 校正。
 
 
 七、reference-kind 的含义
@@ -630,6 +631,22 @@ measurements CSV，直接运行：
 
     exposure_linearity_diagnostics.csv
         每个通道、每个 level 下，标准 X 和截距校正 X 的相对跨度与变异系数。
+        同时包含 exposure-linearity R2，用于判断 DN_c - Dark_c 是否随曝光时间接近线性。
+
+    exposure_window_diagnostics.csv
+        按实际曝光点自动生成曝光区间并统计 X 稳定性。例如一组数据如果包含
+        100、200、300、400 ms，会统计 100-400 ms、200-400 ms、300-400 ms。
+        只有一个曝光点的 400-400 ms 不能判断波动，因此不会输出。
+        对于 50、75、100、150、175、200、250 ms 这样的数据，则会自动生成
+        50-250 ms、75-250 ms、100-250 ms 等区间。
+        每个区间都会给出标准 X 波动和截距校正 X 波动。
+        该文件适合判断低曝光点是否拉大误差，以及正式标定应选用哪个曝光区间。
+
+    exposure_window_stability_*.png
+        每个 level 的曝光区间稳定性图。虚线表示标准 X，实线表示截距校正 X。
+
+    exposure_window_stability_summary.png
+        多个 level 的曝光区间稳定性平均图，用于快速比较不同曝光下的整体趋势。
 
     fit_r.png
     fit_g.png
