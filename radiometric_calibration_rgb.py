@@ -280,6 +280,139 @@ def prepare_fit_table(
     return df
 
 
+def exposure_group_keys(df: pd.DataFrame) -> pd.Series:
+    if "level" in df.columns:
+        return df["level"].fillna("").astype(str)
+    ref_cols = [f"ref_{ch}" for ch in CHANNELS]
+    if all(c in df.columns for c in ref_cols):
+        return df[ref_cols].apply(lambda row: "_".join(f"{float(v):.12g}" for v in row), axis=1)
+    return pd.Series(["all"] * len(df), index=df.index)
+
+
+def safe_rel_span_percent(values: np.ndarray) -> float:
+    values = np.asarray(values, float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan")
+    mean_abs = float(abs(np.mean(values)))
+    if mean_abs == 0:
+        return float("nan")
+    return float((np.max(values) - np.min(values)) / mean_abs * 100.0)
+
+
+def safe_cv_percent(values: np.ndarray) -> float:
+    values = np.asarray(values, float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan")
+    mean_abs = float(abs(np.mean(values)))
+    if mean_abs == 0:
+        return float("nan")
+    return float(np.std(values) / mean_abs * 100.0)
+
+
+def estimate_exposure_intercept_for_channel(fit_table: pd.DataFrame, ch: str) -> Dict[str, object]:
+    t = fit_table["exposure_s_used"].to_numpy(float)
+    y = fit_table[f"dn_corr_{ch}"].to_numpy(float)
+    groups = exposure_group_keys(fit_table)
+    mask = np.isfinite(t) & np.isfinite(y) & (t > 0)
+    t = t[mask]
+    y = y[mask]
+    groups = groups[mask]
+
+    usable_groups = []
+    for group in sorted(groups.unique()):
+        group_t = t[groups.to_numpy() == group]
+        if len(np.unique(group_t)) >= 2:
+            usable_groups.append(group)
+
+    usable = groups.isin(usable_groups).to_numpy()
+    t = t[usable]
+    y = y[usable]
+    groups = groups[usable]
+    if len(usable_groups) == 0 or len(y) < len(usable_groups) + 1:
+        return {
+            "available": False,
+            "q_intercept": 0.0,
+            "r2": float("nan"),
+            "rmse": float("nan"),
+            "groups_used": [],
+            "note": "Need at least one group with two or more exposure times.",
+        }
+
+    design = np.zeros((len(y), 1 + len(usable_groups)), dtype=float)
+    design[:, 0] = 1.0
+    group_to_col = {group: idx + 1 for idx, group in enumerate(usable_groups)}
+    group_values = groups.to_numpy()
+    for row_idx, group in enumerate(group_values):
+        design[row_idx, group_to_col[group]] = t[row_idx]
+
+    params, *_ = np.linalg.lstsq(design, y, rcond=None)
+    pred = design @ params
+    residual = pred - y
+    rmse = float(np.sqrt(np.mean(residual**2)))
+    ss_res = float(np.sum(residual**2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+    slopes = {group: float(params[group_to_col[group]]) for group in usable_groups}
+    return {
+        "available": True,
+        "q_intercept": float(params[0]),
+        "r2": r2,
+        "rmse": rmse,
+        "groups_used": usable_groups,
+        "slopes_by_group": slopes,
+        "note": "Model: DN_corr_c = slope_c_group * exposure_s + q_c",
+    }
+
+
+def add_intercept_corrected_x(fit_table: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Dict[str, object]]]:
+    df = fit_table.copy()
+    corrections: Dict[str, Dict[str, object]] = {}
+    t = df["exposure_s_used"].to_numpy(float)
+    for ch in CHANNELS:
+        info = estimate_exposure_intercept_for_channel(df, ch)
+        corrections[ch] = info
+        q = float(info["q_intercept"])
+        df[f"exposure_intercept_q_{ch}"] = q
+        df[f"x_intercept_{ch}"] = (df[f"dn_corr_{ch}"].to_numpy(float) - q) / t
+    return df, corrections
+
+
+def exposure_stability_diagnostics(
+    fit_table: pd.DataFrame,
+    corrections: Dict[str, Dict[str, object]],
+) -> pd.DataFrame:
+    groups = exposure_group_keys(fit_table)
+    rows = []
+    for ch in CHANNELS:
+        for group in sorted(groups.unique()):
+            sub = fit_table[groups == group]
+            if len(sub) == 0:
+                continue
+            x_standard = sub[f"x_{ch}"].to_numpy(float)
+            x_corrected = sub[f"x_intercept_{ch}"].to_numpy(float)
+            exposures = sub["exposure_s_used"].to_numpy(float)
+            rows.append(
+                {
+                    "channel": ch,
+                    "group": group,
+                    "n": len(sub),
+                    "exposure_min_s": float(np.min(exposures)),
+                    "exposure_max_s": float(np.max(exposures)),
+                    "q_intercept": float(corrections[ch]["q_intercept"]),
+                    "intercept_model_r2": float(corrections[ch]["r2"]),
+                    "standard_x_mean": float(np.mean(x_standard)),
+                    "standard_x_rel_span_percent": safe_rel_span_percent(x_standard),
+                    "standard_x_cv_percent": safe_cv_percent(x_standard),
+                    "intercept_x_mean": float(np.mean(x_corrected)),
+                    "intercept_x_rel_span_percent": safe_rel_span_percent(x_corrected),
+                    "intercept_x_cv_percent": safe_cv_percent(x_corrected),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def finite_positive_pair(x: np.ndarray, y: np.ndarray, log_space: bool) -> Tuple[np.ndarray, np.ndarray]:
     mask = np.isfinite(x) & np.isfinite(y)
     if log_space:
@@ -371,7 +504,13 @@ def plot_effective_response(eff: pd.DataFrame, output_dir: Path) -> None:
     plt.close()
 
 
-def plot_fit(ch: str, fit: Dict[str, object], output_dir: Path) -> None:
+def plot_fit(
+    ch: str,
+    fit: Dict[str, object],
+    output_dir: Path,
+    filename_suffix: str = "",
+    x_label: Optional[str] = None,
+) -> None:
     x = np.asarray(fit["x"], float)
     y = np.asarray(fit["y"], float)
     pred = np.asarray(fit["pred"], float)
@@ -380,12 +519,12 @@ def plot_fit(ch: str, fit: Dict[str, object], output_dir: Path) -> None:
     plt.figure(figsize=(6.8, 4.8))
     plt.scatter(x, y, label="measurement", s=32)
     plt.plot(x[order], pred[order], label="fit", linewidth=2)
-    plt.xlabel(f"X_{ch} = (DN_{ch} - Dark_{ch}) / exposure_s")
+    plt.xlabel(x_label or f"X_{ch} = (DN_{ch} - Dark_{ch}) / exposure_s")
     plt.ylabel(f"L_eff_{ch}")
     plt.grid(True, alpha=0.25)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(output_dir / f"fit_{ch}.png", dpi=180)
+    plt.savefig(output_dir / f"fit{filename_suffix}_{ch}.png", dpi=180)
     plt.close()
 
     rel_error = np.where(y != 0, (pred - y) / y * 100.0, np.nan)
@@ -396,12 +535,34 @@ def plot_fit(ch: str, fit: Dict[str, object], output_dir: Path) -> None:
     plt.ylabel("Relative error (%)")
     plt.grid(True, alpha=0.25)
     plt.tight_layout()
-    plt.savefig(output_dir / f"residual_{ch}.png", dpi=180)
+    plt.savefig(output_dir / f"residual{filename_suffix}_{ch}.png", dpi=180)
     plt.close()
 
 
-def write_report(results: Dict[str, Dict[str, object]], output_dir: Path) -> None:
-    lines = ["# RGB Radiometric Calibration Result", ""]
+def results_to_serializable(results: Dict[str, Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+    return {
+        ch: {
+            "equation": format_equation(ch, results[ch]["fit"]),
+            "model": results[ch]["fit"]["model"],
+            "degree": results[ch]["fit"]["degree"],
+            "coefficients": results[ch]["fit"]["coefficients"],
+            "metrics": results[ch]["metrics"],
+        }
+        for ch in CHANNELS
+    }
+
+
+def write_report(
+    results: Dict[str, Dict[str, object]],
+    output_dir: Path,
+    filename: str,
+    title: str,
+    extra_lines: Optional[list[str]] = None,
+) -> None:
+    lines = [f"# {title}", ""]
+    if extra_lines:
+        lines.extend(extra_lines)
+        lines.append("")
     for ch in CHANNELS:
         fit = results[ch]["fit"]
         met = results[ch]["metrics"]
@@ -414,7 +575,105 @@ def write_report(results: Dict[str, Dict[str, object]], output_dir: Path) -> Non
         lines.append(f"- MAPE: {met['mape_percent']:.4f}%")
         lines.append(f"- R2: {met['r2']:.8f}")
         lines.append("")
-    (output_dir / "calibration_report.md").write_text("\n".join(lines), encoding="utf-8")
+    (output_dir / filename).write_text("\n".join(lines), encoding="utf-8")
+
+
+def fit_all_channels(
+    fit_table: pd.DataFrame,
+    x_prefix: str,
+    model: str,
+    degree: int,
+    output_dir: Path,
+    filename_suffix: str,
+    x_label_template: str,
+) -> Dict[str, Dict[str, object]]:
+    results: Dict[str, Dict[str, object]] = {}
+    for ch in CHANNELS:
+        model_degree = 1 if model == "linear" else degree
+        fit = fit_channel(
+            fit_table[f"{x_prefix}{ch}"].to_numpy(float),
+            fit_table[f"ref_{ch}"].to_numpy(float),
+            model,
+            model_degree,
+        )
+        met = metrics(np.asarray(fit["y"], float), np.asarray(fit["pred"], float))
+        results[ch] = {"fit": fit, "metrics": met}
+        plot_fit(
+            ch,
+            fit,
+            output_dir,
+            filename_suffix=filename_suffix,
+            x_label=x_label_template.format(ch=ch),
+        )
+    return results
+
+
+def build_calibration_comparison(
+    standard_results: Dict[str, Dict[str, object]],
+    intercept_results: Dict[str, Dict[str, object]],
+    corrections: Dict[str, Dict[str, object]],
+) -> pd.DataFrame:
+    rows = []
+    for ch in CHANNELS:
+        for label, results in [
+            ("standard", standard_results),
+            ("intercept_corrected", intercept_results),
+        ]:
+            met = results[ch]["metrics"]
+            rows.append(
+                {
+                    "channel": ch,
+                    "calibration_form": label,
+                    "q_intercept": 0.0 if label == "standard" else float(corrections[ch]["q_intercept"]),
+                    "exposure_intercept_model_r2": float(corrections[ch]["r2"]),
+                    "rmse": met["rmse"],
+                    "mae": met["mae"],
+                    "mape_percent": met["mape_percent"],
+                    "r2": met["r2"],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def write_comparison_report(
+    output_dir: Path,
+    comparison: pd.DataFrame,
+    corrections: Dict[str, Dict[str, object]],
+) -> None:
+    lines = ["# Calibration Form Comparison", ""]
+    lines.append("This run outputs both the standard exposure normalization and the residual-intercept corrected form.")
+    lines.append("")
+    lines.append("Standard:")
+    lines.append("")
+    lines.append("    X_c = (DN_c - Dark_c) / exposure_s")
+    lines.append("")
+    lines.append("Intercept corrected:")
+    lines.append("")
+    lines.append("    X_c = (DN_c - Dark_c - q_c) / exposure_s")
+    lines.append("")
+    lines.append("Estimated exposure residual intercepts:")
+    lines.append("")
+    for ch in CHANNELS:
+        info = corrections[ch]
+        lines.append(
+            f"- {ch.upper()}: q_{ch} = {float(info['q_intercept']):.10g}, "
+            f"exposure-linearity R2 = {float(info['r2']):.8f}"
+        )
+    lines.append("")
+    lines.append("Metric comparison:")
+    lines.append("")
+    lines.append("| Channel | Form | q | RMSE | MAE | MAPE % | R2 |")
+    lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: |")
+    for _, row in comparison.iterrows():
+        lines.append(
+            f"| {str(row['channel']).upper()} | {row['calibration_form']} | "
+            f"{float(row['q_intercept']):.6g} | {float(row['rmse']):.6g} | "
+            f"{float(row['mae']):.6g} | {float(row['mape_percent']):.4f} | "
+            f"{float(row['r2']):.8f} |"
+        )
+    lines.append("")
+    lines.append("Use the corrected form only when exposure-linearity diagnostics show that a residual intercept improves cross-exposure stability.")
+    (output_dir / "calibration_comparison.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def write_template(path: Path) -> None:
@@ -632,40 +891,92 @@ def main() -> None:
 
     measurements, measurement_path = load_measurements(args)
     fit_table = prepare_fit_table(measurements, measurement_path, eff, args.reference_kind)
+    fit_table, exposure_corrections = add_intercept_corrected_x(fit_table)
     fit_table.to_csv(output_dir / "calibration_fit_table.csv", index=False, encoding="utf-8-sig")
 
-    results: Dict[str, Dict[str, object]] = {}
-    for ch in CHANNELS:
-        model_degree = 1 if args.model == "linear" else args.degree
-        fit = fit_channel(
-            fit_table[f"x_{ch}"].to_numpy(float),
-            fit_table[f"ref_{ch}"].to_numpy(float),
-            args.model,
-            model_degree,
-        )
-        met = metrics(np.asarray(fit["y"], float), np.asarray(fit["pred"], float))
-        results[ch] = {"fit": fit, "metrics": met}
-        plot_fit(ch, fit, output_dir)
-
-    serializable = {
-        ch: {
-            "equation": format_equation(ch, results[ch]["fit"]),
-            "model": results[ch]["fit"]["model"],
-            "degree": results[ch]["fit"]["degree"],
-            "coefficients": results[ch]["fit"]["coefficients"],
-            "metrics": results[ch]["metrics"],
-        }
-        for ch in CHANNELS
-    }
-    (output_dir / "calibration_coefficients.json").write_text(
-        json.dumps(serializable, indent=2, ensure_ascii=False),
+    diagnostics = exposure_stability_diagnostics(fit_table, exposure_corrections)
+    diagnostics.to_csv(output_dir / "exposure_linearity_diagnostics.csv", index=False, encoding="utf-8-sig")
+    (output_dir / "exposure_intercept_correction.json").write_text(
+        json.dumps(exposure_corrections, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    write_report(results, output_dir)
+
+    standard_results = fit_all_channels(
+        fit_table,
+        "x_",
+        args.model,
+        args.degree,
+        output_dir,
+        filename_suffix="",
+        x_label_template="X_{ch} = (DN_{ch} - Dark_{ch}) / exposure_s",
+    )
+    intercept_results = fit_all_channels(
+        fit_table,
+        "x_intercept_",
+        args.model,
+        args.degree,
+        output_dir,
+        filename_suffix="_intercept",
+        x_label_template="X_{ch} = (DN_{ch} - Dark_{ch} - q_{ch}) / exposure_s",
+    )
+
+    standard_serializable = results_to_serializable(standard_results)
+    intercept_serializable = results_to_serializable(intercept_results)
+    for ch in CHANNELS:
+        intercept_serializable[ch]["exposure_intercept_q"] = float(exposure_corrections[ch]["q_intercept"])
+        intercept_serializable[ch]["x_definition"] = f"X_{ch} = (DN_{ch} - Dark_{ch} - q_{ch}) / exposure_s"
+
+    (output_dir / "calibration_coefficients.json").write_text(
+        json.dumps(standard_serializable, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (output_dir / "calibration_coefficients_standard.json").write_text(
+        json.dumps(standard_serializable, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (output_dir / "calibration_coefficients_intercept_corrected.json").write_text(
+        json.dumps(intercept_serializable, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    comparison = build_calibration_comparison(standard_results, intercept_results, exposure_corrections)
+    comparison.to_csv(output_dir / "calibration_comparison.csv", index=False, encoding="utf-8-sig")
+
+    write_report(
+        standard_results,
+        output_dir,
+        "calibration_report_standard.md",
+        "RGB Radiometric Calibration Result - Standard",
+    )
+    write_report(
+        intercept_results,
+        output_dir,
+        "calibration_report_intercept_corrected.md",
+        "RGB Radiometric Calibration Result - Intercept Corrected",
+        extra_lines=[
+            "Exposure residual intercept correction:",
+            "",
+            "    X_c = (DN_c - Dark_c - q_c) / exposure_s",
+        ],
+    )
+    write_comparison_report(output_dir, comparison, exposure_corrections)
+    write_report(
+        standard_results,
+        output_dir,
+        "calibration_report.md",
+        "RGB Radiometric Calibration Result - Standard",
+        extra_lines=[
+            "This run also generated intercept-corrected calibration outputs.",
+            "See calibration_report_intercept_corrected.md and calibration_comparison.md.",
+        ],
+    )
 
     print(f"Done. Output directory: {output_dir.resolve()}")
     for ch in CHANNELS:
-        print(format_equation(ch, results[ch]["fit"]))
+        q = float(exposure_corrections[ch]["q_intercept"])
+        print(f"{ch.upper()} exposure intercept q_{ch}: {q:.10g}")
+        print("Standard: " + format_equation(ch, standard_results[ch]["fit"]))
+        print("Intercept corrected: " + format_equation(ch, intercept_results[ch]["fit"]))
 
 
 if __name__ == "__main__":

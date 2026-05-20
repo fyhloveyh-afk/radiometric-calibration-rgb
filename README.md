@@ -516,6 +516,28 @@ measurements CSV，直接运行：
     3. 如果必须合并低曝光和高曝光数据，应考虑加入 q_c 截距校正。
     4. 不要把饱和数据用于截距校正或辐射标定。
 
+当前脚本会自动同时输出两种标定形式：
+
+    标准形式：
+        X_c = (DN_c - Dark_c) / exposure_s
+
+    残余截距校正形式：
+        X_c = (DN_c - Dark_c - q_c) / exposure_s
+
+脚本不会在运行中弹出交互选择，而是把两套结果都保存下来，并生成误差对比。这样每次运行都是可复现的，也便于后续追踪到底使用了哪一种公式。
+
+残余截距 q_c 的估计方式是：
+
+    DN_corr_c(level, t) = S_c(level) * t + q_c
+
+其中：
+
+    level       表示同一个黑体温度或同一个亮度等级
+    S_c(level) 允许每个 level 有不同斜率
+    q_c         是同一通道共用的残余截距
+
+也就是说，脚本不会把不同温度/亮度等级强行拟合同一条曝光曲线，而是只估计跨 level 共享的残余 offset。
+
 可能造成残余截距或低曝光 X 偏差的原因包括：
 
     1. 暗场和亮场拍摄时相机温度、黑电平钳位或内部 offset 状态不完全一致。
@@ -577,12 +599,37 @@ measurements CSV，直接运行：
 
     calibration_fit_table.csv
         实际用于拟合的数据表，包含扣暗场和除曝光时间后的 X_R/G/B。
+        如果能估计曝光残余截距，还会包含 x_intercept_r/g/b 和 exposure_intercept_q_r/g/b。
 
     calibration_coefficients.json
-        三通道标定系数，适合后续程序读取。
+        三通道标准形式标定系数，适合后续程序读取。该文件保留为默认兼容输出。
+
+    calibration_coefficients_standard.json
+        标准形式标定系数：
+            X_c = (DN_c - Dark_c) / exposure_s
+
+    calibration_coefficients_intercept_corrected.json
+        带残余截距校正的标定系数：
+            X_c = (DN_c - Dark_c - q_c) / exposure_s
 
     calibration_report.md
-        标定公式和误差指标。
+        标准形式标定公式和误差指标，并提示是否生成了截距校正结果。
+
+    calibration_report_standard.md
+        标准形式的完整报告。
+
+    calibration_report_intercept_corrected.md
+        带残余截距校正形式的完整报告。
+
+    calibration_comparison.csv
+    calibration_comparison.md
+        标准形式和截距校正形式的 RMSE、MAE、MAPE、R2 对比。
+
+    exposure_intercept_correction.json
+        每个通道估计出的 q_c、曝光线性 R2、RMSE、每个 level 的斜率等。
+
+    exposure_linearity_diagnostics.csv
+        每个通道、每个 level 下，标准 X 和截距校正 X 的相对跨度与变异系数。
 
     fit_r.png
     fit_g.png
@@ -632,6 +679,17 @@ measurements CSV，直接运行：
 G、B 通道同理。
 
 如果使用 poly 或 logpoly 模型，按 calibration_report.md 或 calibration_coefficients.json 中的公式计算。
+
+如果决定使用截距校正结果，应读取：
+
+    calibration_coefficients_intercept_corrected.json
+
+并按下面形式计算：
+
+    X_r = (DN_r - Dark_r - q_r) / exposure_s
+    L_eff_r = a_r * X_r + b_r
+
+其中 q_r 在 JSON 中的 exposure_intercept_q 字段里。G、B 通道同理。
 
 
 十一、常见错误
