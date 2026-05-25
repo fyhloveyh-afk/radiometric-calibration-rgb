@@ -9,3 +9,11 @@ calibration_output*/
 # Temporary report extraction artifacts
 report_media/
 extracted_report_text.txt
+
+# Local calibration data and generated analysis artifacts
+fyh标定/
+calibration_workbook_build/
+raw_overexposure_tool/
+raw_overexposure_tool.zip
+roi_debug_samples*.jpg
+标定工况.xlsx

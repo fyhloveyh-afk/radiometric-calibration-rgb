@@ -535,6 +535,103 @@ def format_equation(ch: str, fit: Dict[str, object]) -> str:
     return f"ln(L_eff_{ch}) = " + " + ".join(terms)
 
 
+def predict_fit_values(fit: Dict[str, object], x: np.ndarray) -> np.ndarray:
+    coeff = np.asarray(fit["coefficients"], dtype=float)
+    model = str(fit["model"])
+    if model in {"linear", "poly"}:
+        return np.polyval(coeff, x)
+    if model == "logpoly":
+        pred = np.full_like(x, np.nan, dtype=float)
+        mask = x > 0
+        pred[mask] = np.exp(np.polyval(coeff, np.log(x[mask])))
+        return pred
+    raise ValueError(f"unknown model: {model}")
+
+
+def robust_scale(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan")
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    if mad > 0:
+        return 1.4826 * mad
+    std = float(np.std(values))
+    return std if std > 0 else float("nan")
+
+
+def outlier_label(row: pd.Series) -> str:
+    temperature = row.get("blackbody_temp_c", "")
+    exposure = row.get("exposure_ms", "")
+    level = row.get("level", "")
+    return f"{level} T{temperature} exposure {exposure} ms"
+
+
+def detect_outliers(
+    fit_table: pd.DataFrame,
+    x_prefix: str,
+    model: str,
+    degree: int,
+    threshold: float,
+    min_channels: int,
+) -> pd.DataFrame:
+    report = pd.DataFrame(
+        {
+            "row_index": fit_table.index,
+            "level": fit_table["level"] if "level" in fit_table.columns else "",
+            "blackbody_temp_c": fit_table["blackbody_temp_c"] if "blackbody_temp_c" in fit_table.columns else "",
+            "exposure_ms": fit_table["exposure_ms"] if "exposure_ms" in fit_table.columns else "",
+            "outlier_channel_count": 0,
+            "is_outlier": False,
+            "reason": "",
+        }
+    )
+    channel_reasons: dict[int, list[str]] = {int(idx): [] for idx in fit_table.index}
+    groups = exposure_group_keys(fit_table)
+
+    for ch in CHANNELS:
+        values = fit_table[f"{x_prefix}{ch}"].to_numpy(float)
+        deviation = np.full(len(fit_table), np.nan, dtype=float)
+        robust_z = np.full(len(fit_table), np.nan, dtype=float)
+        flagged = np.zeros(len(fit_table), dtype=bool)
+
+        for group in sorted(groups.unique()):
+            group_mask = (groups.to_numpy() == group) & np.isfinite(values)
+            if int(group_mask.sum()) < 4:
+                continue
+            group_values = values[group_mask]
+            center = float(np.median(group_values))
+            scale = robust_scale(group_values - center)
+            deviation[group_mask] = values[group_mask] - center
+            if not np.isfinite(scale) or scale <= 0:
+                continue
+            robust_z[group_mask] = np.abs(deviation[group_mask]) / scale
+            flagged |= group_mask & (robust_z > threshold)
+
+        if not np.isfinite(robust_z).any():
+            report[f"{ch}_deviation"] = np.nan
+            report[f"{ch}_robust_z"] = np.nan
+            report[f"{ch}_is_outlier"] = False
+            continue
+
+        report[f"{ch}_deviation"] = deviation
+        report[f"{ch}_robust_z"] = robust_z
+        report[f"{ch}_is_outlier"] = flagged
+        flagged_positions = np.where(flagged)[0]
+        for pos in flagged_positions:
+            idx = int(fit_table.index[pos])
+            channel_reasons[idx].append(f"{ch}:z={float(robust_z[pos]):.2f}")
+
+    for idx, reasons in channel_reasons.items():
+        count = len(reasons)
+        report.loc[report["row_index"] == idx, "outlier_channel_count"] = count
+        if count >= min_channels:
+            report.loc[report["row_index"] == idx, "is_outlier"] = True
+            report.loc[report["row_index"] == idx, "reason"] = "; ".join(reasons)
+    return report
+
+
 def plot_effective_response(eff: pd.DataFrame, output_dir: Path) -> None:
     plt.figure(figsize=(8, 4.8))
     for ch, color in [("r", "red"), ("g", "green"), ("b", "blue")]:
@@ -904,7 +1001,31 @@ def write_blackbody_template(path: Path) -> None:
 def add_image_folder_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--image-dir", type=Path, help="folder containing blackbody light raw images")
     parser.add_argument("--dark-dir", type=Path, help="optional folder containing dark raw images")
+    parser.add_argument(
+        "--input-format",
+        choices=["raw", "bmp"],
+        default="raw",
+        help="image data source to average in image-folder mode: raw or bmp; default raw",
+    )
     parser.add_argument("--roi", type=image_measurements.parse_roi, help="ROI as x,y,width,height")
+    parser.add_argument(
+        "--roi-mode",
+        choices=["manual", "auto-anchor"],
+        default="manual",
+        help="manual uses --roi; auto-anchor detects a stable hotspot anchor from high-temperature BMP previews",
+    )
+    parser.add_argument(
+        "--anchor-temperatures",
+        type=image_measurements.parse_float_list,
+        default=image_measurements.parse_float_list("1400,1500"),
+        help="comma-separated temperatures used to detect the auto ROI anchor, default 1400,1500",
+    )
+    parser.add_argument("--roi-size", type=int, default=120, help="square ROI size for --roi-mode auto-anchor")
+    parser.add_argument("--search-radius", type=int, default=220, help="local auto ROI search radius around the anchor")
+    parser.add_argument("--max-roi-shift", type=float, default=180.0, help="maximum local ROI center shift before anchor fallback")
+    parser.add_argument("--anchor-min-confidence", type=float, default=0.45, help="minimum confidence for anchor detections")
+    parser.add_argument("--local-min-confidence", type=float, default=0.35, help="minimum confidence for local ROI refinement")
+    parser.add_argument("--roi-audit-csv", type=Path, help="optional CSV listing ROI used for every image")
     parser.add_argument("--raw-width", type=int, help="raw image width in pixels")
     parser.add_argument("--raw-height", type=int, help="raw image height in pixels")
     parser.add_argument("--raw-dtype", default="uint16", help="raw sample dtype, for example uint8 or uint16")
@@ -924,7 +1045,44 @@ def add_image_folder_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--raw-byte-order", choices=["native", "little", "big"], default="native")
     parser.add_argument("--raw-ext", default=".raw", help="raw file extension, default .raw")
+    parser.add_argument(
+        "--include-conditions-csv",
+        type=Path,
+        help="optional CSV with temperature_c/exposure_ms rows to include in image-folder mode",
+    )
+    parser.add_argument(
+        "--expected-repeats",
+        type=image_measurements.parse_repeat_list,
+        default=image_measurements.parse_repeat_list("1,2,3"),
+        help="comma-separated expected repeat numbers; missing ones are reported, default 1,2,3",
+    )
+    parser.add_argument(
+        "--min-repeats",
+        type=int,
+        default=2,
+        help="minimum available repeats required per temperature/exposure group, default 2",
+    )
+    parser.add_argument(
+        "--missing-repeat-policy",
+        choices=["warn", "error", "ignore"],
+        default="warn",
+        help="what to do when expected repeats are missing; default warn",
+    )
+    parser.add_argument("--repeat-audit-csv", type=Path, help="optional CSV listing present and missing repeats")
     parser.add_argument("--emissivity", type=float, default=1.0, help="blackbody emissivity for image-folder mode")
+    parser.add_argument(
+        "--bad-pixel-policy",
+        choices=["none", "exclude"],
+        default="none",
+        help="exclude uses dark RAW frames to mask bad pixels before ROI averaging; default none",
+    )
+    parser.add_argument(
+        "--bad-pixel-threshold",
+        type=float,
+        default=8192.0,
+        help="dark RAW median threshold for marking bad pixels, default 8192",
+    )
+    parser.add_argument("--bad-pixel-audit-csv", type=Path, help="optional CSV listing bad-pixel counts by exposure")
     parser.add_argument("--dark-r", type=float, help="constant dark R value")
     parser.add_argument("--dark-g", type=float, help="constant dark G value")
     parser.add_argument("--dark-b", type=float, help="constant dark B value")
@@ -934,24 +1092,72 @@ def add_image_folder_args(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="optional path to save the measurement CSV generated from --image-dir",
     )
+    parser.add_argument(
+        "--exclude-exposure-ms",
+        type=image_measurements.parse_float_list,
+        default=(),
+        help="comma-separated exposure times to exclude from fitting, for example 0.2",
+    )
+    parser.add_argument(
+        "--outlier-policy",
+        choices=["none", "warn", "exclude"],
+        default="none",
+        help="detect within-temperature exposure-consistency outliers; exclude removes them before final fitting",
+    )
+    parser.add_argument(
+        "--outlier-threshold",
+        type=float,
+        default=6.0,
+        help="robust residual z-score threshold for outlier detection, default 6.0",
+    )
+    parser.add_argument(
+        "--outlier-min-channels",
+        type=int,
+        default=2,
+        help="minimum flagged channels required to mark a measurement row as an outlier, default 2",
+    )
 
 
 def validate_image_folder_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.outlier_threshold <= 0:
+        parser.error("--outlier-threshold must be positive")
+    if args.outlier_min_channels <= 0 or args.outlier_min_channels > len(CHANNELS):
+        parser.error("--outlier-min-channels must be between 1 and 3")
+
     if args.image_dir is None:
         return
 
     if args.measurements is not None:
         parser.error("choose either --measurements or --image-dir, not both")
-    if args.roi is None:
+    if args.roi_mode == "manual" and args.roi is None:
         parser.error("--roi is required when using --image-dir")
-    if args.raw_width is None or args.raw_height is None:
-        parser.error("--raw-width and --raw-height are required when using --image-dir")
-    if args.raw_width <= 0 or args.raw_height <= 0:
-        parser.error("--raw-width/--raw-height must be positive")
+    if args.input_format == "raw" and (args.raw_width is None or args.raw_height is None):
+        parser.error("--raw-width and --raw-height are required for raw input")
+    if args.raw_width is not None and args.raw_width <= 0:
+        parser.error("--raw-width must be positive")
+    if args.raw_height is not None and args.raw_height <= 0:
+        parser.error("--raw-height must be positive")
+    if args.roi_mode == "auto-anchor":
+        if args.roi_size <= 0:
+            parser.error("--roi-size must be positive")
+        if args.raw_width is not None and args.raw_height is not None and args.roi_size > min(args.raw_width, args.raw_height):
+            parser.error("--roi-size must fit within the image")
+        if args.search_radius <= 0:
+            parser.error("--search-radius must be positive")
+        if args.max_roi_shift < 0:
+            parser.error("--max-roi-shift must be non-negative")
+    if args.input_format == "bmp" and args.raw_format == "bayer":
+        parser.error("--raw-format bayer is only valid for raw input")
     if args.raw_format == "rgb" and args.raw_channels < 3:
         parser.error("--raw-channels must be at least 3 for RGB mode")
     if args.raw_format == "bayer" and args.raw_channels != 1:
         parser.error("--raw-format bayer requires --raw-channels 1")
+    if args.min_repeats <= 0:
+        parser.error("--min-repeats must be positive")
+    if args.bad_pixel_threshold <= 0:
+        parser.error("--bad-pixel-threshold must be positive")
+    if args.bad_pixel_policy != "none" and args.dark_dir is None:
+        parser.error("--bad-pixel-policy requires --dark-dir")
 
     constant_dark_values = [args.dark_r, args.dark_g, args.dark_b]
     has_partial_constant_dark = any(v is not None for v in constant_dark_values) and not all(
@@ -972,7 +1178,16 @@ def validate_image_folder_args(parser: argparse.ArgumentParser, args: argparse.N
 def image_folder_args_for_converter(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(
         image_dir=args.image_dir,
+        input_format=args.input_format,
         roi=args.roi,
+        roi_mode=args.roi_mode,
+        anchor_temperatures=args.anchor_temperatures,
+        roi_size=args.roi_size,
+        search_radius=args.search_radius,
+        max_roi_shift=args.max_roi_shift,
+        anchor_min_confidence=args.anchor_min_confidence,
+        local_min_confidence=args.local_min_confidence,
+        roi_audit_csv=args.roi_audit_csv,
         width=args.raw_width,
         height=args.raw_height,
         dtype=args.raw_dtype,
@@ -982,7 +1197,15 @@ def image_folder_args_for_converter(args: argparse.Namespace) -> argparse.Namesp
         bayer_pattern=args.bayer_pattern,
         byte_order=args.raw_byte_order,
         raw_ext=args.raw_ext,
+        include_conditions_csv=args.include_conditions_csv,
+        expected_repeats=args.expected_repeats,
+        min_repeats=args.min_repeats,
+        missing_repeat_policy=args.missing_repeat_policy,
+        repeat_audit_csv=args.repeat_audit_csv,
         emissivity=args.emissivity,
+        bad_pixel_policy=args.bad_pixel_policy,
+        bad_pixel_threshold=args.bad_pixel_threshold,
+        bad_pixel_audit_csv=args.bad_pixel_audit_csv,
         dark_dir=args.dark_dir,
         dark_r=args.dark_r,
         dark_g=args.dark_g,
@@ -993,15 +1216,32 @@ def image_folder_args_for_converter(args: argparse.Namespace) -> argparse.Namesp
 
 def load_measurements(args: argparse.Namespace) -> tuple[pd.DataFrame, Path]:
     if args.image_dir is None:
-        return pd.read_csv(args.measurements), args.measurements
+        measurements = pd.read_csv(args.measurements)
+        return filter_measurements(measurements, args), args.measurements
 
     rows = image_measurements.build_rows_from_image_folder(image_folder_args_for_converter(args))
-    measurements = pd.DataFrame(rows)
+    measurements = filter_measurements(pd.DataFrame(rows), args)
     measurement_path = args.write_generated_measurements or (args.output_dir / "generated_blackbody_measurements.csv")
     measurement_path.parent.mkdir(parents=True, exist_ok=True)
     measurements.to_csv(measurement_path, index=False, encoding="utf-8-sig")
     print(f"Wrote generated measurements: {measurement_path}")
     return measurements, measurement_path
+
+
+def filter_measurements(measurements: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    df = measurements.copy()
+    if args.exclude_exposure_ms:
+        if "exposure_ms" not in df.columns:
+            raise ValueError("--exclude-exposure-ms requires exposure_ms in the measurement table")
+        exposure = df["exposure_ms"].to_numpy(float)
+        keep = np.ones(len(df), dtype=bool)
+        for excluded in args.exclude_exposure_ms:
+            keep &= np.abs(exposure - float(excluded)) > image_measurements.EXPOSURE_MATCH_TOLERANCE_MS
+        excluded_count = int((~keep).sum())
+        if excluded_count:
+            print(f"Excluded {excluded_count} measurement row(s) by --exclude-exposure-ms")
+        df = df.loc[keep].copy()
+    return df
 
 
 def parse_args() -> argparse.Namespace:
@@ -1051,6 +1291,24 @@ def main() -> None:
     measurements, measurement_path = load_measurements(args)
     fit_table = prepare_fit_table(measurements, measurement_path, eff, args.reference_kind)
     fit_table, exposure_corrections = add_intercept_corrected_x(fit_table)
+    if args.outlier_policy != "none":
+        outlier_report = detect_outliers(
+            fit_table,
+            "x_intercept_",
+            args.model,
+            args.degree,
+            args.outlier_threshold,
+            args.outlier_min_channels,
+        )
+        outlier_report.to_csv(output_dir / "outlier_diagnostics.csv", index=False, encoding="utf-8-sig")
+        outlier_mask = outlier_report["is_outlier"].to_numpy(bool)
+        outlier_count = int(outlier_mask.sum())
+        print(f"Outlier detection flagged {outlier_count} measurement row(s).")
+        if args.outlier_policy == "exclude" and outlier_count:
+            fit_table.to_csv(output_dir / "calibration_fit_table_before_outlier_exclusion.csv", index=False, encoding="utf-8-sig")
+            fit_table = fit_table.loc[~outlier_mask].copy()
+            fit_table, exposure_corrections = add_intercept_corrected_x(fit_table)
+            print(f"Excluded {outlier_count} outlier row(s) before final fitting.")
     fit_table.to_csv(output_dir / "calibration_fit_table.csv", index=False, encoding="utf-8-sig")
 
     diagnostics = exposure_stability_diagnostics(fit_table, exposure_corrections)
